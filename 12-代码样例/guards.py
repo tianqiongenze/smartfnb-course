@@ -45,6 +45,29 @@ def parse_proc_request(question: str) -> dict:
     word = word.strip(" ,。!?，。！？ ")
     return {"qty": qty, "unit": "kg", "ing_hint": word or None}
 
+_STORE_RE = re.compile(r"(\d{1,3})\s*号店")
+_DATE_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+_CN_DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+
+def extract_store_date(question: str, default_store: int, default_date) -> tuple[int, str]:
+    """[OPT-D08] 从问题文本抽取店号/日期覆盖页面默认值('2号店2026-10-23'不得落到默认7/今天)。
+    未命中原样返回默认; 纯函数可测。"""
+    store = default_store
+    m = _STORE_RE.search(question or "")
+    if m and 1 <= int(m.group(1)) <= 999:
+        store = int(m.group(1))
+    day = str(default_date)
+    for rx in (_DATE_RE, _CN_DATE_RE):
+        m = rx.search(question or "")
+        if m:
+            try:
+                import datetime as _dt
+                day = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+            except ValueError:
+                pass                      # 非法日期保持默认
+            break
+    return store, day
+
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 
 def _norm(n: float) -> list[str]:

@@ -12,7 +12,9 @@ import pymysql
 from mcp.server.fastmcp import FastMCP
 
 DB = dict(host=os.getenv("DB_HOST", "tidb.infra.svc.cluster.local"), port=4000,
-          user="root", charset="utf8mb4", database="fnb")
+          user=os.getenv("DB_USER", "root"),
+          password=os.getenv("DB_PASSWORD", ""),        # [OPT-C3] 生产必须注入, 禁止root空口令直连
+          charset="utf8mb4", database="fnb")
 
 mcp = FastMCP("fnb-tools", host="0.0.0.0", port=8000, stateless_http=True)
 

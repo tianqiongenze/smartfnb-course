@@ -17,7 +17,8 @@ ToolFn = Callable[[str, dict], Awaitable[dict | None]]
 
 async def act_with_tools(ctx: SessionContext, budget: Budget, tool_fn: ToolFn,
                          tool_name: str, args: dict) -> dict | None:
-    """ACT: 调工具, 结果进上下文溯源源(数字依据), 失败返回None"""
+    """ACT: 调工具, 结果进上下文溯源源(数字依据), 失败返回None; 调用计入预算[OPT-C2]"""
+    budget.charge_tool()
     data = await tool_fn(tool_name, args)
     if data is not None:
         ctx.add_retrieved(json.dumps(data, ensure_ascii=False)[:4000])
