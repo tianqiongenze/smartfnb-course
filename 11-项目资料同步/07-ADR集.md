@@ -61,3 +61,32 @@
 - **决策**：`Clients.agentWebClient` 显式构造 `JdkClientHttpConnector(HttpClient.Version.HTTP_1_1)`，禁用协议升级协商。
 - **后果**：SSE 桥接恢复（端到端 0 失败）；代价是放弃 h2c 多路复用（内网单跳场景无实际收益）。
 - **关联**：D-06；配套前端 D-05（graphql 改 POST）、D-07（SSE `data:` 帧兼容 + Vue 响应式整体替换）于 web-admin 0.1.5 修复。
+
+## ADR-0017 GitOps 选型 Flux v2（V4对标新增，2026-11-14）
+
+- **状态**：**已实施**（2026-11-15，GitOps 落地记录见下），常规回滚 = `git revert` → 重推 artifact → Flux 自动收敛。
+- **落地记录（2026-11-15，air-gapped 实测）**：
+  1. **CLI 与版本**：k8s 1.28 兼容上限 = **Flux v2.3.0**（v2.4.0 起官方兼容表要求 ≥1.29），装于 master `/usr/local/bin/flux`（GitHub release 下载，sha256 与官方 checksums.txt 核对一致）。
+  2. **镜像面**：source/kustomize-controller 直连 ghcr.io 拉取，其余 4 控制器经 `ghcr.nju.edu.cn` 镜像源（daocloud `ghcr.m.daocloud.io` 白名单拒收 fluxcd、`docker.m.*` 不代理 ghcr，均实测不可用）；6 镜像全部改写为 `10.167.2.175:30500/flux/*` 推入本地 registry，安装清单为 `flux install --export --registry=10.167.2.175:30500/flux`（控制器 requests 沿用上游默认小值：source=50m/64Mi、其余=100m/64Mi，limits 1cpu/1Gi；显式插块会与上游自带 resources 构成重复 YAML key，已回退），入库 `smartfnb/gitops/flux-system-install.yaml`。
+  3. **源模式**：采用 **OCIRepository**（`flux push artifact` 实测可推 plain-HTTP 本地 registry；源 `insecure: true`），artifact=仓库 `smartfnb/deploy` 目录，tag `main` 移动。
+  4. **构建口径（smartfnb/deploy/kustomization.yaml）**：15 yaml − 14-otel（ADR-0012）；另按实测剥离 4 类：`otel-collector-config.yaml`（非 k8s 清单）、`secrets.enc.yaml`（SOPS 密文不入 flux）、两个 `<SET_AT_APPLY>` 占位 Secret 文档（防覆盖现网真实值）、**6 个一次性 Job 文档**（Job 带 `ttlSecondsAfterFinished`，TTL 删除后会被 flux 复活重跑；且实测对已完成的旧版 Job 做 SSA dry-run 触发 `spec.template: field is immutable` 拒绝——`daily-demand` 案例）。CronJob 模板可变，正常纳入。
+  5. **结果**：Kustomization `fnb-apps`（targetNamespace=fnb-prod，wait+healthChecks，prune=false 首期）READY=True，`flux diff` = **0 漂移**；密钥仍按 deploy/README.md 方式b 手工注入，flux 不触碰 Secret。
+  6. **agent-runtime 0.6.7→0.6.8** 经 Git 升 tag + 重推 artifact + reconcile 完成（managedFields 证实由 kustomize-controller Apply，非 kubectl 直改）。
+- **背景**：docs/11 §二交付与运维域对标指出"15 yaml 手工 apply"为主要差距，且 docs/10 教训6 证明手工 apply/set image 正是镜像漂移与"一键恢复会回退"的根因。本集群为 air-gapped 两节点（镜像仅来自本地 registry 10.167.2.175:30500）。
+- **决策**：采用 **Flux v2**（source-controller + kustomize-controller），Git 仓库为唯一真源，Flux Kustomization 指向 `smartfnb/deploy/`；不选 Argo CD。
+- **理由**：① Flux 提供 air-gapped 官方安装路径（`flux install --export` 导出 manifests + `crane copy --all-tags` 搬运 controller 镜像到私有 registry，fluxcd.io/flux/installation/configuration/air-gapped），与本项目零外网约束直接匹配；② 无 UI 组件、controller 资源占用小，适配两节点混部小集群（对照 docs/10 对 BestEffort 饥饿的教训，控制面组件必须显式 requests）；③ Kustomize 原生贴合并清退前平铺清单（deploy/*.yaml），迁移成本低；④ 密钥链路用 SOPS+age（见 deploy/secrets.enc.yaml），与 docs/11 对标的 SOPS/ESO 分层一致。
+- **Argo CD 不选理由**：UI/API Server 组件更重、air-gapped 需搬运的镜像面更长，本项目无多租户发布审批 UI 诉求。
+- **revert 语义**：常规回滚 = `git revert <commit>` 后 Flux reconcile 自动收敛回上一状态；应急 = `flux suspend` + `kubectl rollout undo`，事后必须把手工状态回写仓库（docs/10 教训6），否则下轮 reconcile 冲突。铁律：**禁止 kubectl 直改集群造成漂移**，现网任何变更先落 Git。
+- **revisit条件**：多集群/多环境或需要发布审批 UI 时重评 Argo CD；上游镜像拉取需 Harbor+Flux Mirror 供应链治理（docs/11 §四对标项）时一并纳入。
+
+## ADR-0018 TiDB 备份选型：br 为主 + dumpling 为辅（V4对标新增，2026-11-14）
+
+- **状态**：选型已定，**实施待恢复环境**（docs/11 §五 B 组"O4/O5 实施待环境"）。
+- **背景**：fnb 库（1.5 亿行 / 12.2 GB）于 2026-10-30 在**零备份**状态下被 DROP，永久丢失（docs/10:17；docs/11 §一）。备份能力必须先于数据重建落地，杜绝重演。
+- **决策**：
+  1. **物理备份 = TiDB BR**：每日 02:00 full backup + **log stream 常开**（PITR，RPO≈分钟级），存储后端走 S3 兼容 MinIO（不落集群节点盘，共享 TiDB infra 不可写本地路径）；备份期间按 br 文档确认 `tikv_gc_life_time` 与 GC 冲突规避。
+  2. **逻辑导出 = dumpling 为辅**：每周日 + 任意 schema/主数据变更前导出（schema、store/unit_dict/ingredient 等小表），跨版本可移植、可读，作为 br 二进制快照之外的兜底与审计副本（RPO=24h/周级，仅兜底不作为主恢复路径）。
+- **调度**：K8S CronJob（fnb-prod 或独立备份命名空间）执行 `tiup br` 容器任务；dumpling 变更前手动 + 周度 CronJob。
+- **恢复演练**：数据重建后每月一次 `br restore` 到临时库 `fnb_verify` 验证可用性（不触碰生产路径），演练记录入 docs。
+- **对标依据**：TiDB 官方 br log+full PITR / MinIO(S3) 路径（docs.pingcap.com/tidb/stable/br-use-overview，docs/11 §四）。
+- **局限声明**：本集群共享 TiDB 的 MinIO 是否在位未核（清退终态无集群侧操作），实施时若缺 MinIO 需先落对象存储再开备份；br/tidb 版本矩阵以恢复时集群 TiDB v8.5.8 为准验证。
